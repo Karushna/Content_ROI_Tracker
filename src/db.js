@@ -1,4 +1,4 @@
-const { Pool } = require("pg");
+const mysql = require("mysql2/promise");
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
@@ -6,6 +6,6 @@ if (!connectionString) {
   process.exit(1);
 }
 
-const pool = new Pool({ connectionString });
+const pool = mysql.createPool(connectionString);
 
 module.exports = { pool };
