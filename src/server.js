@@ -1,6 +1,6 @@
 const express = require("express");
 const cookieParser = require("cookie-parser");
-const { pool } = require("./db");
+const { db, FieldValue } = require("./db");
 const {
   ensureVisitorCookie,
   captureUtmFromQuery,
@@ -14,15 +14,27 @@ app.use(cookieParser());
 
 const PORT = Number(process.env.PORT) || 3000;
 
+function tsToIso(ts) {
+  if (!ts) return null;
+  if (typeof ts.toDate === "function") return ts.toDate().toISOString();
+  return null;
+}
+
 /** First-touch: earliest recorded campaign for this visitor */
 async function firstTouchCampaign(visitorId) {
-  const [rows] = await pool.query(
-    `SELECT utm_campaign FROM visits
-     WHERE visitor_id = ?
-     ORDER BY created_at ASC
-     LIMIT 1`,
-    [visitorId]
-  );
+  const snap = await db
+    .collection("visits")
+    .where("visitor_id", "==", visitorId)
+    .get();
+  const rows = snap.docs.map((d) => ({
+    utm_campaign: d.data().utm_campaign,
+    created_at: d.data().created_at,
+  }));
+  rows.sort((a, b) => {
+    const ma = a.created_at?.toMillis?.() ?? 0;
+    const mb = b.created_at?.toMillis?.() ?? 0;
+    return ma - mb;
+  });
   return rows[0]?.utm_campaign ?? null;
 }
 
@@ -59,15 +71,17 @@ async function recordVisit(req, res) {
     });
   }
   try {
-    const [header] = await pool.query(
-      `INSERT INTO visits (visitor_id, utm_campaign) VALUES (?, ?)`,
-      [visitorId, utmCampaign]
-    );
-    const [rows] = await pool.query(
-      `SELECT id, created_at FROM visits WHERE id = ?`,
-      [header.insertId]
-    );
-    res.status(201).json(rows[0]);
+    const ref = await db.collection("visits").add({
+      visitor_id: visitorId,
+      utm_campaign: utmCampaign,
+      created_at: FieldValue.serverTimestamp(),
+    });
+    const doc = await ref.get();
+    const data = doc.data();
+    res.status(201).json({
+      id: doc.id,
+      created_at: tsToIso(data.created_at),
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "failed to record visit" });
@@ -111,56 +125,72 @@ app.post("/leads", ensureVisitorCookie, async (req, res) => {
         "no campaign to attribute: add utm_campaign or record a visit first",
     });
   }
+  const emailNorm = email.trim().toLowerCase();
+  const leadRef = db.collection("leads").doc(emailNorm);
   try {
-    const [header] = await pool.query(
-      `INSERT INTO leads (email, visitor_id, utm_campaign) VALUES (?, ?, ?)`,
-      [email.trim().toLowerCase(), visitorId.trim(), campaign]
-    );
-    const [rows] = await pool.query(
-      `SELECT id, email, visitor_id, utm_campaign, created_at
-       FROM leads WHERE id = ?`,
-      [header.insertId]
-    );
-    res.status(201).json(rows[0]);
+    await leadRef.create({
+      email: emailNorm,
+      visitor_id: visitorId.trim(),
+      utm_campaign: campaign,
+      created_at: FieldValue.serverTimestamp(),
+    });
   } catch (e) {
-    if (e.code === "ER_DUP_ENTRY") {
+    const dup =
+      e.code === 6 ||
+      e.code === "ALREADY_EXISTS" ||
+      e.code === "already-exists";
+    if (dup) {
       return res.status(409).json({ error: "email already exists" });
     }
     console.error(e);
-    res.status(500).json({ error: "failed to create lead" });
+    return res.status(500).json({ error: "failed to create lead" });
   }
+  const doc = await leadRef.get();
+  const data = doc.data();
+  res.status(201).json({
+    id: doc.id,
+    email: data.email,
+    visitor_id: data.visitor_id,
+    utm_campaign: data.utm_campaign,
+    created_at: tsToIso(data.created_at),
+  });
 });
 
 /**
  * Record revenue for a lead.
- * Body: { lead_id: number, amount: number }
+ * Body: { lead_id: string, amount: number }  (lead_id is the lead document id, same as normalized email)
  */
 app.post("/deals", async (req, res) => {
-  const { lead_id: leadId, amount } = req.body ?? {};
-  const id = Number(leadId);
-  if (!Number.isInteger(id) || id < 1) {
-    return res.status(400).json({ error: "lead_id must be a positive integer" });
+  const { lead_id: leadIdRaw, amount } = req.body ?? {};
+  const leadId =
+    leadIdRaw === undefined || leadIdRaw === null
+      ? ""
+      : String(leadIdRaw).trim();
+  if (!leadId) {
+    return res.status(400).json({ error: "lead_id is required" });
   }
   const amt = Number(amount);
   if (!Number.isFinite(amt) || amt < 0) {
     return res.status(400).json({ error: "amount must be a non-negative number" });
   }
   try {
-    const [checkRows] = await pool.query(`SELECT id FROM leads WHERE id = ?`, [
-      id,
-    ]);
-    if (checkRows.length === 0) {
+    const leadSnap = await db.collection("leads").doc(leadId).get();
+    if (!leadSnap.exists) {
       return res.status(404).json({ error: "lead not found" });
     }
-    const [header] = await pool.query(
-      `INSERT INTO deals (lead_id, amount) VALUES (?, ?)`,
-      [id, amt]
-    );
-    const [rows] = await pool.query(
-      `SELECT id, lead_id, amount, created_at FROM deals WHERE id = ?`,
-      [header.insertId]
-    );
-    res.status(201).json(rows[0]);
+    const ref = await db.collection("deals").add({
+      lead_id: leadId,
+      amount: amt,
+      created_at: FieldValue.serverTimestamp(),
+    });
+    const doc = await ref.get();
+    const data = doc.data();
+    res.status(201).json({
+      id: doc.id,
+      lead_id: data.lead_id,
+      amount: data.amount,
+      created_at: tsToIso(data.created_at),
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "failed to create deal" });
@@ -172,17 +202,46 @@ app.post("/deals", async (req, res) => {
  */
 app.get("/reports/by-campaign", async (_req, res) => {
   try {
-    const [rows] = await pool.query(
-      `SELECT l.utm_campaign,
-              CAST(COUNT(DISTINCT l.id) AS SIGNED) AS lead_count,
-              CAST(COUNT(d.id) AS SIGNED) AS deal_count,
-              CAST(COALESCE(SUM(d.amount), 0) AS CHAR) AS revenue
-       FROM leads l
-       LEFT JOIN deals d ON d.lead_id = l.id
-       GROUP BY l.utm_campaign
-       ORDER BY COALESCE(SUM(d.amount), 0) DESC`
-    );
-    res.json({ campaigns: rows });
+    const [leadsSnap, dealsSnap] = await Promise.all([
+      db.collection("leads").get(),
+      db.collection("deals").get(),
+    ]);
+    const leadById = new Map();
+    leadsSnap.docs.forEach((d) => {
+      const x = d.data();
+      leadById.set(d.id, {
+        utm_campaign: x.utm_campaign,
+      });
+    });
+    const byCampaign = new Map();
+    for (const d of leadsSnap.docs) {
+      const u = d.data().utm_campaign;
+      if (!byCampaign.has(u)) {
+        byCampaign.set(u, { lead_count: 0, deal_count: 0, revenue: 0 });
+      }
+      byCampaign.get(u).lead_count += 1;
+    }
+    for (const d of dealsSnap.docs) {
+      const x = d.data();
+      const lead = leadById.get(x.lead_id);
+      if (!lead) continue;
+      const u = lead.utm_campaign;
+      if (!byCampaign.has(u)) {
+        byCampaign.set(u, { lead_count: 0, deal_count: 0, revenue: 0 });
+      }
+      const row = byCampaign.get(u);
+      row.deal_count += 1;
+      row.revenue += Number(x.amount) || 0;
+    }
+    const campaigns = [...byCampaign.entries()]
+      .map(([utm_campaign, v]) => ({
+        utm_campaign,
+        lead_count: v.lead_count,
+        deal_count: v.deal_count,
+        revenue: String(v.revenue),
+      }))
+      .sort((a, b) => Number(b.revenue) - Number(a.revenue));
+    res.json({ campaigns });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "report failed" });
@@ -193,14 +252,16 @@ app.use((_req, res) => {
   res.status(404).json({ error: "not found" });
 });
 
-pool
-  .query("SELECT 1")
+db
+  .collection("visits")
+  .limit(1)
+  .get()
   .then(() => {
     app.listen(PORT, () => {
       console.log(`Content ROI Tracker listening on ${PORT}`);
     });
   })
   .catch((err) => {
-    console.error("Database connection failed:", err.message);
+    console.error("Firebase/Firestore failed:", err.message);
     process.exit(1);
   });
